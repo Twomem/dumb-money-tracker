@@ -1,35 +1,45 @@
-name: Dumb Money Summary Bot
+name: Dumb Money Alpha Tracker
+
 on:
   schedule:
-    - cron: '0 */3 * * *' # Runs every 3 hours
-  workflow_dispatch:      # Allows you to click a button to run it manually
+    # Runs at minute 15 of every 3rd hour (Staggered to avoid peak GitHub traffic)
+    - cron: '15 */3 * * *'
+  workflow_dispatch:
+    # Allows you to click "Run workflow" manually for testing
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    
+    # Crucial for allowing the bot to save 'last_video.txt' back to your repo
     permissions:
-      contents: write     # Allows GitHub to update last_video.txt
+      contents: write
+
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout code
+        uses: actions/checkout@v4
+
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.9'
+          python-version: '3.11'
+
       - name: Install dependencies
-        run: pip install -r requirements.txt
-      - name: Run logic
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Alpha Tracker
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          WHATSAPP_PHONE: ${{ secrets.WHATSAPP_PHONE }}
-          WHATSAPP_KEY: ${{ secrets.WHATSAPP_KEY }}
-          EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
-          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python main.py
-      - name: Commit changes
+
+      - name: Commit and Push last_video.txt
         run: |
-          git config --global user.name 'github-actions'
-          git config --global user.email 'github-actions@github.com'
+          git config --global user.name "AlphaTracker-Bot"
+          git config --global user.email "actions@github.com"
           git add last_video.txt
-          git commit -m "Update last video" || exit 0
-          git push
+          # Only commit if there are changes to avoid erroring
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Update last processed video ID" && git push)
