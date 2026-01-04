@@ -46,17 +46,24 @@ def main():
                 return
 
     try:
-        # FIX: The latest library requires calling .list_transcripts or .fetch()
-        # instead of the old get_transcript() on some environments.
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        # 1. Create a tool instance (The "New" Way)
+        ytt_api = YouTubeTranscriptApi() 
+        
+        # 2. Get the list of available transcripts
+        transcript_list = ytt_api.list(video_id)
+        
+        # 3. Find the English one and fetch it
         transcript = transcript_list.find_transcript(['en']).fetch()
         full_text = " ".join([t['text'] for t in transcript])
         
+        # 4. Pass to Gemini for analysis
         summary = get_summary(full_text, title)
         
+        # 5. Notify via Telegram
         msg = f"🚀 *New Alpha*\n\n*Video:* {title}\n\n{summary}\n\n[Watch]({link})"
         send_telegram(msg)
         
+        # 6. Save video ID so we don't repeat
         with open("last_video.txt", "w") as f:
             f.write(video_id)
             
