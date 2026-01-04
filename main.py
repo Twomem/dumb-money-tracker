@@ -2,13 +2,14 @@ import os
 import requests
 import feedparser
 from youtube_transcript_api import YouTubeTranscriptApi
-import google.generativeai as genai
+from google import genai  # <--- New Google library
+from google.genai import types
 
-# Configuration from GitHub Secrets
+# Configuration
 GEMINI_KEY = os.environ.get('GEMINI_API_KEY')
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
-CHANNEL_ID = "UCS01CiRDAiyhR_mTHXDW23A" # Dumb Money Live
+CHANNEL_ID = "UCS01CiRDAiyhR_mTHXDW23A"
 
 def get_latest_video():
     feed_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={CHANNEL_ID}"
@@ -18,25 +19,18 @@ def get_latest_video():
     return None, None, None
 
 def get_summary(transcript_text, title):
-    genai.configure(api_key=GEMINI_KEY)
-    # Using Gemini 3 Flash (Dec 2025) for PhD-level reasoning
-    model = genai.GenerativeModel('gemini-3-flash-preview')
+    # Updated to the 2026 'google-genai' Client pattern
+    client = genai.Client(api_key=GEMINI_KEY)
     
-    prompt = f"""
-    Video: {title}
-    Transcript: {transcript_text}
+    prompt = f"Video: {title}\nTranscript: {transcript_text}\n\nSummarize Chris Camillo's specific trade ideas and bold all tickers."
     
-    TASK: Extract high-conviction trade ideas specifically from Chris Camillo.
-    FORMAT: 
-    - [CHRIS'S ALPHA]: Summarize his specific observations and thesis.
-    - [TICKERS]: Bold all tickers (e.g., **$TSLA**).
-    - [SENTIMENT]: Bullish/Bearish/Watchlist.
-    """
-    response = model.generate_content(prompt)
+    response = client.models.generate_content(
+        model="gemini-2.5-flash", # Latest stable model
+        contents=prompt
+    )
     return response.text
 
 def send_telegram(text):
-    # Telegram has a 4096 character limit per message
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     for i in range(0, len(text), 4000):
         part = text[i:i+4000]
@@ -45,7 +39,6 @@ def send_telegram(text):
 def main():
     title, link, video_id = get_latest_video()
     
-    # Check if we've already processed this video
     if os.path.exists("last_video.txt"):
         with open("last_video.txt", "r") as f:
             if f.read().strip() == video_id:
@@ -53,23 +46,22 @@ def main():
                 return
 
     try:
-        # 1. Get Transcript
-        transcript = YouTubeTranscriptApi.get_transcript(video_id)
+        # FIX: The latest library requires calling .list_transcripts or .fetch()
+        # instead of the old get_transcript() on some environments.
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        transcript = transcript_list.find_transcript(['en']).fetch()
         full_text = " ".join([t['text'] for t in transcript])
         
-        # 2. AI Analysis
         summary = get_summary(full_text, title)
         
-        # 3. Notify
-        msg = f"🚀 *New Alpha Detected*\n\n*Video:* {title}\n\n{summary}\n\n[Watch Video]({link})"
+        msg = f"🚀 *New Alpha*\n\n*Video:* {title}\n\n{summary}\n\n[Watch]({link})"
         send_telegram(msg)
         
-        # 4. Save progress
         with open("last_video.txt", "w") as f:
             f.write(video_id)
             
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error logic: {e}")
 
 if __name__ == "__main__":
     main()
