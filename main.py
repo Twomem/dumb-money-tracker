@@ -1,88 +1,75 @@
 import os
 import requests
 import feedparser
-import smtplib
-# from email.message import EmailMessage
 from youtube_transcript_api import YouTubeTranscriptApi
 import google.generativeai as genai
 
-# --- Configuration (Pulled from GitHub Secrets) ---
-CHANNEL_ID = "UCS01CiRDAiyhR_mTHXDW23A" 
-RSS_URL = f"https://www.youtube.com/feeds/videos.xml?channel_id={CHANNEL_ID}"
+# Configuration from GitHub Secrets
 GEMINI_KEY = os.environ.get('GEMINI_API_KEY')
-WHATSAPP_PHONE = os.environ.get('WHATSAPP_PHONE')
-WHATSAPP_KEY = os.environ.get('WHATSAPP_KEY')
-# EMAIL_ADDRESS = os.environ.get('EMAIL_ADDRESS')
-# EMAIL_PASSWORD = os.environ.get('EMAIL_PASSWORD') # Gmail App Password
-# RECIPIENT_EMAIL = os.environ.get('RECIPIENT_EMAIL')
+TELEGRAM_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
+TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
+CHANNEL_ID = "UCS01CiRDAiyhR_mTHXDW23A" # Dumb Money Live
 
 def get_latest_video():
-    feed = feedparser.parse(RSS_URL)
-    if not feed.entries: return None, None
-    return feed.entries[0].id.split(":")[-1], feed.entries[0].title
+    feed_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={CHANNEL_ID}"
+    feed = feedparser.parse(feed_url)
+    if feed.entries:
+        return feed.entries[0].title, feed.entries[0].link, feed.entries[0].id.split(':')[-1]
+    return None, None, None
 
 def get_summary(transcript_text, title):
     genai.configure(api_key=GEMINI_KEY)
+    # Using Gemini 3 Flash (Dec 2025) for PhD-level reasoning
     model = genai.GenerativeModel('gemini-3-flash-preview')
+    
     prompt = f"""
-    Video Title: {title}
+    Video: {title}
     Transcript: {transcript_text}
     
-    TASK: Provide a detailed summary of this video focusing on what Chris Camillo said. 
-    1. Identify his primary investment thesis for this video.
-    2. List every ticker (e.g., $AAPL, $TSLA) he mentioned and his sentiment (Bullish/Bearish).
-    3. Detail his reasoning
-    4. Ignore Dave and Jordan unless they are directly debating Chris's specific trade.
-    Format: Use bullet points. Use *bold* for tickers and key takes.
+    TASK: Extract high-conviction trade ideas specifically from Chris Camillo.
+    FORMAT: 
+    - [CHRIS'S ALPHA]: Summarize his specific observations and thesis.
+    - [TICKERS]: Bold all tickers (e.g., **$TSLA**).
+    - [SENTIMENT]: Bullish/Bearish/Watchlist.
     """
     response = model.generate_content(prompt)
     return response.text
 
-def send_whatsapp(message):
-    # CallMeBot API expects URL-encoded text
-    url = f"https://api.callmebot.com/whatsapp.php?phone={WHATSAPP_PHONE}&text={requests.utils.quote(message)}&apikey={WHATSAPP_KEY}"
-    r = requests.get(url)
-    return r.status_code
+def send_telegram(text):
+    # Telegram has a 4096 character limit per message
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    for i in range(0, len(text), 4000):
+        part = text[i:i+4000]
+        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": part, "parse_mode": "Markdown"})
 
-# def send_email(subject, body):
-#    msg = EmailMessage()
-#    msg.set_content(body)
-#    msg['Subject'] = subject
-#    msg['From'] = EMAIL_ADDRESS
-#    msg['To'] = RECIPIENT_EMAIL
-#    
-#    with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
-#        smtp.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
-#        smtp.send_message(msg)
-
-# --- Main Execution ---
-video_id, title = get_latest_video()
-
-# Check against last processed video
-if os.path.exists("last_video.txt"):
-    with open("last_video.txt", "r") as f:
-        if f.read().strip() == video_id:
-            print("No new video found.")
-            exit()
-
-try:
-    print(f"Processing new video: {title}")
-    transcript = YouTubeTranscriptApi.get_transcript(video_id)
-    text = " ".join([i['text'] for i in transcript])
+def main():
+    title, link, video_id = get_latest_video()
     
-    summary = get_summary(text, title)
-    
-    # 1. Send WhatsApp
-    wa_status = send_whatsapp(f"*Dumb Money Chris-Only Summary*\n{title}\n\n{summary}")
-    print(f"WhatsApp sent (Status: {wa_status})")
-    
-    # 2. Send Email
-    # send_email(f"Dumb Money Summary: {title}", summary)
-    # print("Email sent.")
-    
-    # 3. Save progress
-    with open("last_video.txt", "w") as f:
-        f.write(video_id)
+    # Check if we've already processed this video
+    if os.path.exists("last_video.txt"):
+        with open("last_video.txt", "r") as f:
+            if f.read().strip() == video_id:
+                print("No new video found.")
+                return
 
-except Exception as e:
-    print(f"Error: {e}")
+    try:
+        # 1. Get Transcript
+        transcript = YouTubeTranscriptApi.get_transcript(video_id)
+        full_text = " ".join([t['text'] for t in transcript])
+        
+        # 2. AI Analysis
+        summary = get_summary(full_text, title)
+        
+        # 3. Notify
+        msg = f"🚀 *New Alpha Detected*\n\n*Video:* {title}\n\n{summary}\n\n[Watch Video]({link})"
+        send_telegram(msg)
+        
+        # 4. Save progress
+        with open("last_video.txt", "w") as f:
+            f.write(video_id)
+            
+    except Exception as e:
+        print(f"Error: {e}")
+
+if __name__ == "__main__":
+    main()
