@@ -5,9 +5,10 @@ to Telegram via a GitHub Actions cron job.
 
 ## How it works
 
-1. A GitHub Actions workflow runs every 3 hours.
+1. A GitHub Actions workflow runs every 8 hours.
 2. The workflow checks the channel RSS feed for a new video.
-3. If a new video is found, the transcript is fetched and summarized with Gemini.
+3. If a new video is found, the transcript is fetched (Supadata if configured, otherwise
+   `youtube_transcript_api`) and summarized with Gemini.
 4. The summary is sent to Telegram and the last processed video ID is saved.
 
 ## Required secrets
@@ -15,6 +16,7 @@ to Telegram via a GitHub Actions cron job.
 Set these GitHub Actions secrets:
 
 - `GEMINI_API_KEY`
+- `SUPADATA_API_KEY` (optional, uses Supadata to fetch transcripts)
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
 
