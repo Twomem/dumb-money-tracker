@@ -1,293 +1,155 @@
-import argparse
 import os
-from typing import Iterable
-
-import feedparser
 import requests
 from google import genai
 
-# Configuration
 MODEL_NAME = "gemini-2.5-flash"
 CHANNEL_ID = "UCS01CiRDAiyhR_mTHXDW23A"
-FEED_URL = f"https://www.youtube.com/feeds/videos.xml?channel_id={CHANNEL_ID}"
 LAST_VIDEO_PATH = "last_video.txt"
-TELEGRAM_MESSAGE_LIMIT = 4000
-SUPADATA_DEFAULT_URL = "https://api.supadata.ai/v1/youtube/transcript"
+
 SUPADATA_CHANNEL_VIDEOS_URL = "https://api.supadata.ai/v1/youtube/channel/videos"
+SUPADATA_TRANSCRIPT_URL = "https://api.supadata.ai/v1/youtube/transcript"
+
+TELEGRAM_MESSAGE_LIMIT = 4000
 
 
-def get_env_var(name: str) -> str:
-    value = os.environ.get(name)
-    if not value:
-        raise ValueError(f"Missing required environment variable: {name}")
-    return value
+def env(name: str) -> str:
+    v = os.environ.get(name)
+    if not v:
+        raise ValueError(f"Missing required env var: {name}")
+    return v
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Summarize the latest Dumb Money Live video and send to Telegram."
-    )
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Send a summary even if the latest video was already processed.",
-    )
-    return parser.parse_args()
-
-
-def get_latest_allowed_video(
-    feed_url: str, allowed_video_ids: set[str]
-) -> tuple[str | None, str | None, str | None]:
-    feed = feedparser.parse(feed_url)
-    for entry in feed.entries:
-        video_id = entry.id.split(":")[-1]
-        if video_id in allowed_video_ids:
-            return entry.title, entry.link, video_id
-    return None, None, None
-
-
-def read_last_video_id(path: str) -> str | None:
-    if not os.path.exists(path):
+def read_last_video_id() -> str | None:
+    if not os.path.exists(LAST_VIDEO_PATH):
         return None
-    with open(path, "r", encoding="utf-8") as handle:
-        value = handle.read().strip()
-    return value or None
+    v = open(LAST_VIDEO_PATH, "r", encoding="utf-8").read().strip()
+    return v or None
 
 
-def write_last_video_id(path: str, video_id: str) -> None:
-    with open(path, "w", encoding="utf-8") as handle:
-        handle.write(video_id)
+def write_last_video_id(video_id: str) -> None:
+    with open(LAST_VIDEO_PATH, "w", encoding="utf-8") as f:
+        f.write(video_id)
 
 
-def fetch_channel_videos(api_key: str, channel_id: str, video_type: str, limit: int = 25) -> dict:
-    response = requests.get(
+def get_latest_longform_video_id(supadata_key: str, channel_id: str) -> str:
+    # Supadata supports type=video to return ONLY long-form (vertical) videos
+    # Response includes { videoIds: [...], shortIds: [...], liveIds: [...] }
+    r = requests.get(
         SUPADATA_CHANNEL_VIDEOS_URL,
-        headers={"x-api-key": api_key},
-        params={"id": channel_id, "type": video_type, "limit": str(limit)},
+        headers={"x-api-key": supadata_key},
+        params={"id": channel_id, "type": "video", "limit": 5},
         timeout=30,
     )
-    response.raise_for_status()
-    return response.json()
+    r.raise_for_status()
+    data = r.json()
+    video_ids = data.get("videoIds") or []
+    if not video_ids:
+        raise RuntimeError("No long-form videos returned by Supadata.")
+    return str(video_ids[0])  # latest-first
 
 
-def _is_finished_live(item: dict) -> bool:
-    for key in ("status", "liveStatus", "liveBroadcastContent"):
-        value = str(item.get(key, "")).lower()
-        if value in {"live", "upcoming"}:
-            return False
-    return True
-
-
-def extract_allowed_video_ids(payload: dict, *, include_live: bool) -> list[str]:
-    video_ids: list[str] = []
-    for key in ("videoIds", "videos", "video_ids"):
-        items = payload.get(key)
-        if isinstance(items, list):
-            video_ids.extend(str(item) for item in items)
-    if include_live:
-        for key in ("liveIds", "live_ids", "lives"):
-            items = payload.get(key)
-            if isinstance(items, list):
-                video_ids.extend(str(item) for item in items)
-    items = payload.get("items")
-    if isinstance(items, list):
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            item_type = str(item.get("type", "")).lower()
-            if item_type == "short":
-                continue
-            if item_type == "live":
-                if not include_live or not _is_finished_live(item):
-                    continue
-            video_id = item.get("videoId") or item.get("id")
-            if video_id:
-                video_ids.append(str(video_id))
-    return video_ids
-
-
-def _normalize_transcript_payload(payload: object) -> str:
-    if isinstance(payload, str):
-        return payload
-    if isinstance(payload, list):
-        return " ".join(_extract_transcript_text(item) for item in payload).strip()
-    if isinstance(payload, dict):
-        if "text" in payload:
-            return str(payload["text"])
-        for key in ("transcript", "data", "result", "items", "entries"):
-            if key in payload:
-                return _normalize_transcript_payload(payload[key])
-        for key in ("transcript_text", "transcriptText", "content"):
-            if key in payload:
-                value = payload[key]
-                if key == "content" and isinstance(value, list):
-                    return " ".join(_extract_transcript_text(item) for item in value).strip()
-                return str(value)
-    raise ValueError("Supadata response did not include transcript text.")
-
-
-def _extract_transcript_text(item: object) -> str:
-    if isinstance(item, str):
-        return item
-    if isinstance(item, dict):
-        if "text" in item:
-            return str(item["text"])
-        if "transcript" in item:
-            return _normalize_transcript_payload(item["transcript"])
-    return str(item)
-
-
-def fetch_transcript_text_supadata(video_id: str, api_key: str) -> str:
-    base_url = os.environ.get("SUPADATA_BASE_URL", SUPADATA_DEFAULT_URL)
-    # Supadata expects `videoId` (camelCase) or `url` as the query parameter.
-    param_name = os.environ.get("SUPADATA_VIDEO_PARAM", "videoId")
-    headers = {
-        "x-api-key": api_key,
-    }
-    response = requests.get(
-        base_url,
-        headers=headers,
-        params={param_name: video_id, "text": "true"},
-        timeout=30,
+def get_transcript_text(supadata_key: str, video_id: str) -> str:
+    # Supadata youtube transcript supports videoId and text=true (plain text transcript).
+    r = requests.get(
+        SUPADATA_TRANSCRIPT_URL,
+        headers={"x-api-key": supadata_key},
+        params={"videoId": video_id, "text": "true"},
+        timeout=60,
     )
-    response.raise_for_status()
-    payload = response.json()
-    return _normalize_transcript_payload(payload)
+    r.raise_for_status()
+    data = r.json()
+
+    # Docs say text=true returns plain text, but be robust to either string or chunk list.
+    content = data.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        return " ".join(str(x.get("text", "")) for x in content if isinstance(x, dict)).strip()
+
+    raise RuntimeError("Unexpected Supadata transcript response format.")
 
 
-def chunk_text(text: str, max_chars: int = 12000, overlap: int = 600) -> list[str]:
-    words = text.split()
-    chunks: list[str] = []
-    current: list[str] = []
-    current_len = 0
-    for word in words:
-        if current_len + len(word) + 1 > max_chars and current:
-            chunk = " ".join(current)
-            chunks.append(chunk)
-            overlap_words = chunk.split()[-overlap:] if overlap else []
-            current = list(overlap_words)
-            current_len = sum(len(w) + 1 for w in current)
-        current.append(word)
-        current_len += len(word) + 1
+def chunk_text(text: str, max_chars: int = 12000) -> list[str]:
+    chunks, current = [], []
+    n = 0
+    for w in text.split():
+        if n + len(w) + 1 > max_chars and current:
+            chunks.append(" ".join(current))
+            current, n = [], 0
+        current.append(w)
+        n += len(w) + 1
     if current:
         chunks.append(" ".join(current))
     return chunks
 
 
-def build_chunk_prompt(title: str, chunk: str, index: int, total: int) -> str:
-    return (
-        "You are summarizing a long YouTube transcript. Focus ONLY on what "
-        "Chris Camillo says or directly implies.\n\n"
-        f"Video title: {title}\n"
-        f"Chunk {index} of {total}\n\n"
-        "Instructions:\n"
-        "- Summarize Chris's statements, ideas, and any trade theses.\n"
-        "- Ignore other speakers unless they directly respond to Chris.\n"
-        "- Keep the summary detailed but concise.\n\n"
-        f"Transcript chunk:\n{chunk}"
-    )
+def summarize_transcript(title: str, transcript: str, gemini_key: str) -> str:
+    client = genai.Client(api_key=gemini_key)
 
+    chunks = chunk_text(transcript)
+    partials = []
+    for i, c in enumerate(chunks, start=1):
+        prompt = (
+            "You are summarizing a long YouTube transcript.\n"
+            "Focus ONLY on what Chris Camillo says or directly implies.\n\n"
+            f"Video title: {title}\n"
+            f"Chunk {i} of {len(chunks)}\n\n"
+            "Return bullet points with trade theses, catalysts, and actionable insights.\n\n"
+            f"Transcript:\n{c}"
+        )
+        resp = client.models.generate_content(model=MODEL_NAME, contents=prompt)
+        partials.append(resp.text or "")
 
-def build_final_prompt(title: str, chunk_summaries: Iterable[str]) -> str:
-    combined = "\n\n".join(chunk_summaries)
-    return (
-        "You are producing the final detailed summary of a YouTube video.\n"
-        "Focus ONLY on what Chris Camillo says or implies.\n\n"
+    final_prompt = (
+        "Combine the chunk summaries into one clean, detailed summary.\n"
+        "Focus ONLY on what Chris Camillo says or implies.\n"
+        "Use concise bullet points. Group by themes if helpful.\n\n"
         f"Video title: {title}\n\n"
-        "Instructions:\n"
-        "- Provide a detailed summary of Chris's views and reasoning.\n"
-        "- Highlight any trade ideas, catalysts, or actionable insights.\n"
-        "- Use bullet points for clarity.\n\n"
-        f"Chunk summaries:\n{combined}"
+        "Chunk summaries:\n" + "\n\n".join(partials)
     )
+    final = client.models.generate_content(model=MODEL_NAME, contents=final_prompt)
+    return (final.text or "").strip()
 
 
-def summarize_with_gemini(client: genai.Client, prompt: str) -> str:
-    response = client.models.generate_content(model=MODEL_NAME, contents=prompt)
-    return response.text or ""
-
-
-def generate_summary(title: str, transcript_text: str, client: genai.Client) -> str:
-    chunks = chunk_text(transcript_text)
-    chunk_summaries = []
-    for index, chunk in enumerate(chunks, start=1):
-        prompt = build_chunk_prompt(title, chunk, index, len(chunks))
-        chunk_summaries.append(summarize_with_gemini(client, prompt))
-    final_prompt = build_final_prompt(title, chunk_summaries)
-    return summarize_with_gemini(client, final_prompt)
-
-
-def send_telegram_message(token: str, chat_id: str, text: str) -> None:
+def telegram_send(token: str, chat_id: str, text: str) -> None:
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     for start in range(0, len(text), TELEGRAM_MESSAGE_LIMIT):
         part = text[start : start + TELEGRAM_MESSAGE_LIMIT]
-        requests.post(url, data={"chat_id": chat_id, "text": part}, timeout=30)
+        requests.post(url, data={"chat_id": chat_id, "text": part}, timeout=30).raise_for_status()
 
 
-def build_telegram_message(title: str, link: str, summary: str) -> str:
-    return (
+def main() -> None:
+    gemini_key = env("GEMINI_API_KEY")
+    supadata_key = env("SUPADATA_API_KEY")
+    telegram_token = env("TELEGRAM_BOT_TOKEN")
+    telegram_chat_id = env("TELEGRAM_CHAT_ID")
+
+    force = os.environ.get("FORCE_RUN", "").lower() in {"1", "true", "yes"}
+
+    latest_video_id = get_latest_longform_video_id(supadata_key, CHANNEL_ID)
+    last_video_id = read_last_video_id()
+
+    if (not force) and last_video_id == latest_video_id:
+        print("No new long-form video.")
+        return
+
+    # Simple title/link without any YouTube API calls
+    link = f"https://www.youtube.com/watch?v={latest_video_id}"
+    title = f"Dumb Money Live ({latest_video_id})"
+
+    transcript = get_transcript_text(supadata_key, latest_video_id)
+    summary = summarize_transcript(title, transcript, gemini_key)
+
+    message = (
         "🚀 New Dumb Money Live summary\n\n"
-        f"Video: {title}\n"
         f"Link: {link}\n\n"
         "Chris Camillo summary:\n"
         f"{summary}"
     )
 
-
-def should_process_video(*, force_run: bool, last_video_id: str | None, video_id: str) -> bool:
-    if force_run:
-        return True
-    return last_video_id != video_id
-
-
-def main() -> None:
-    args = parse_args()
-    try:
-        gemini_key = get_env_var("GEMINI_API_KEY")
-        telegram_token = get_env_var("TELEGRAM_BOT_TOKEN")
-        telegram_chat_id = get_env_var("TELEGRAM_CHAT_ID")
-        supadata_api_key = get_env_var("SUPADATA_API_KEY")
-    except ValueError as exc:
-        print(exc)
-        return
-    try:
-        video_payload = fetch_channel_videos(supadata_api_key, CHANNEL_ID, "video")
-        live_payload = fetch_channel_videos(supadata_api_key, CHANNEL_ID, "live")
-    except Exception as exc:
-        print(f"Error fetching channel videos: {exc}")
-        return
-    allowed_ids = extract_allowed_video_ids(video_payload, include_live=False)
-    allowed_ids += extract_allowed_video_ids(live_payload, include_live=True)
-    if not allowed_ids:
-        print("No eligible videos found in channel listing.")
-        return
-    title, link, video_id = get_latest_allowed_video(FEED_URL, set(allowed_ids))
-    if not video_id or not title or not link:
-        print("No eligible videos found in feed.")
-        return
-
-    last_video_id = read_last_video_id(LAST_VIDEO_PATH)
-    force_run = args.force or os.environ.get("FORCE_RUN", "").lower() in {
-        "1",
-        "true",
-        "yes",
-    }
-    if not should_process_video(
-        force_run=force_run, last_video_id=last_video_id, video_id=video_id
-    ):
-        print("No new video found.")
-        return
-
-    try:
-        transcript_text = fetch_transcript_text_supadata(video_id, supadata_api_key)
-        client = genai.Client(api_key=gemini_key)
-        summary = generate_summary(title, transcript_text, client)
-        message = build_telegram_message(title, link, summary)
-        send_telegram_message(telegram_token, telegram_chat_id, message)
-        write_last_video_id(LAST_VIDEO_PATH, video_id)
-        print("Summary sent and last video ID updated.")
-    except Exception as exc:
-        print(f"Error processing video: {exc}")
+    telegram_send(telegram_token, telegram_chat_id, message)
+    write_last_video_id(latest_video_id)
+    print("Sent summary + updated last_video.txt")
 
 
 if __name__ == "__main__":
