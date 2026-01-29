@@ -5,7 +5,11 @@ on:
     # Runs at minute 15 of every 3rd hour (Staggered to avoid peak GitHub traffic)
     - cron: '15 */3 * * *'
   workflow_dispatch:
-    # Allows you to click "Run workflow" manually for testing
+    inputs:
+      force:
+        description: "Force sending a summary even if the latest video was already processed."
+        required: false
+        default: "false"
 
 jobs:
   build:
@@ -34,6 +38,7 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FORCE_RUN: ${{ github.event.inputs.force }}
         run: python main.py
 
       - name: Commit and Push last_video.txt
