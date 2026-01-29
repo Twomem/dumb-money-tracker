@@ -74,9 +74,17 @@ def _normalize_transcript_payload(payload: object) -> str:
     if isinstance(payload, list):
         return " ".join(_extract_transcript_text(item) for item in payload).strip()
     if isinstance(payload, dict):
+        if "text" in payload:
+            return str(payload["text"])
         for key in ("transcript", "data", "result", "items", "entries"):
             if key in payload:
                 return _normalize_transcript_payload(payload[key])
+        for key in ("transcript_text", "transcriptText", "content"):
+            if key in payload:
+                value = payload[key]
+                if key == "content" and isinstance(value, list):
+                    return " ".join(_extract_transcript_text(item) for item in value).strip()
+                return str(value)
     raise ValueError("Supadata response did not include transcript text.")
 
 
