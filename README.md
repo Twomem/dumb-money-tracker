@@ -17,6 +17,7 @@ Set these GitHub Actions secrets:
 
 - `GEMINI_API_KEY`
 - `SUPADATA_API_KEY` (optional, uses Supadata to fetch transcripts)
+- `SUPADATA_VIDEO_PARAM` (optional, default `videoId`; use `url` for full YouTube URLs)
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
 

@@ -101,7 +101,7 @@ def fetch_transcript_text_supadata(video_id: str, api_key: str) -> str:
     response = requests.get(
         base_url,
         headers=headers,
-        params={param_name: video_id},
+        params={param_name: video_id, "text": "true"},
         timeout=30,
     )
     response.raise_for_status()
