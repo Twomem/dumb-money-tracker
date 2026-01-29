@@ -5,7 +5,6 @@ from typing import Iterable
 import feedparser
 import requests
 from google import genai
-from youtube_transcript_api import YouTubeTranscriptApi
 
 # Configuration
 MODEL_NAME = "gemini-2.5-flash"
@@ -14,6 +13,7 @@ FEED_URL = f"https://www.youtube.com/feeds/videos.xml?channel_id={CHANNEL_ID}"
 LAST_VIDEO_PATH = "last_video.txt"
 TELEGRAM_MESSAGE_LIMIT = 4000
 SUPADATA_DEFAULT_URL = "https://api.supadata.ai/v1/youtube/transcript"
+SUPADATA_CHANNEL_VIDEOS_URL = "https://api.supadata.ai/v1/youtube/channel/videos"
 
 
 def get_env_var(name: str) -> str:
@@ -35,13 +35,15 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def get_latest_video(feed_url: str) -> tuple[str | None, str | None, str | None]:
+def get_latest_allowed_video(
+    feed_url: str, allowed_video_ids: set[str]
+) -> tuple[str | None, str | None, str | None]:
     feed = feedparser.parse(feed_url)
-    if not feed.entries:
-        return None, None, None
-    entry = feed.entries[0]
-    video_id = entry.id.split(":")[-1]
-    return entry.title, entry.link, video_id
+    for entry in feed.entries:
+        video_id = entry.id.split(":")[-1]
+        if video_id in allowed_video_ids:
+            return entry.title, entry.link, video_id
+    return None, None, None
 
 
 def read_last_video_id(path: str) -> str | None:
@@ -57,15 +59,51 @@ def write_last_video_id(path: str, video_id: str) -> None:
         handle.write(video_id)
 
 
-def fetch_transcript_text(video_id: str) -> str:
-    transcript_api = YouTubeTranscriptApi()
-    transcript_list = transcript_api.list(video_id)
-    try:
-        transcript = transcript_list.find_transcript(["en"])
-    except Exception:
-        transcript = transcript_list.find_generated_transcript(["en"])
-    entries = transcript.fetch()
-    return " ".join(entry["text"] for entry in entries)
+def fetch_channel_videos(api_key: str, channel_id: str, video_type: str, limit: int = 25) -> dict:
+    response = requests.get(
+        SUPADATA_CHANNEL_VIDEOS_URL,
+        headers={"x-api-key": api_key},
+        params={"id": channel_id, "type": video_type, "limit": str(limit)},
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def _is_finished_live(item: dict) -> bool:
+    for key in ("status", "liveStatus", "liveBroadcastContent"):
+        value = str(item.get(key, "")).lower()
+        if value in {"live", "upcoming"}:
+            return False
+    return True
+
+
+def extract_allowed_video_ids(payload: dict, *, include_live: bool) -> list[str]:
+    video_ids: list[str] = []
+    for key in ("videoIds", "videos", "video_ids"):
+        items = payload.get(key)
+        if isinstance(items, list):
+            video_ids.extend(str(item) for item in items)
+    if include_live:
+        for key in ("liveIds", "live_ids", "lives"):
+            items = payload.get(key)
+            if isinstance(items, list):
+                video_ids.extend(str(item) for item in items)
+    items = payload.get("items")
+    if isinstance(items, list):
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type", "")).lower()
+            if item_type == "short":
+                continue
+            if item_type == "live":
+                if not include_live or not _is_finished_live(item):
+                    continue
+            video_id = item.get("videoId") or item.get("id")
+            if video_id:
+                video_ids.append(str(video_id))
+    return video_ids
 
 
 def _normalize_transcript_payload(payload: object) -> str:
@@ -208,14 +246,24 @@ def main() -> None:
         gemini_key = get_env_var("GEMINI_API_KEY")
         telegram_token = get_env_var("TELEGRAM_BOT_TOKEN")
         telegram_chat_id = get_env_var("TELEGRAM_CHAT_ID")
+        supadata_api_key = get_env_var("SUPADATA_API_KEY")
     except ValueError as exc:
         print(exc)
         return
-    supadata_api_key = os.environ.get("SUPADATA_API_KEY")
-
-    title, link, video_id = get_latest_video(FEED_URL)
+    try:
+        video_payload = fetch_channel_videos(supadata_api_key, CHANNEL_ID, "video")
+        live_payload = fetch_channel_videos(supadata_api_key, CHANNEL_ID, "live")
+    except Exception as exc:
+        print(f"Error fetching channel videos: {exc}")
+        return
+    allowed_ids = extract_allowed_video_ids(video_payload, include_live=False)
+    allowed_ids += extract_allowed_video_ids(live_payload, include_live=True)
+    if not allowed_ids:
+        print("No eligible videos found in channel listing.")
+        return
+    title, link, video_id = get_latest_allowed_video(FEED_URL, set(allowed_ids))
     if not video_id or not title or not link:
-        print("No video entries found in feed.")
+        print("No eligible videos found in feed.")
         return
 
     last_video_id = read_last_video_id(LAST_VIDEO_PATH)
@@ -231,10 +279,7 @@ def main() -> None:
         return
 
     try:
-        if supadata_api_key:
-            transcript_text = fetch_transcript_text_supadata(video_id, supadata_api_key)
-        else:
-            transcript_text = fetch_transcript_text(video_id)
+        transcript_text = fetch_transcript_text_supadata(video_id, supadata_api_key)
         client = genai.Client(api_key=gemini_key)
         summary = generate_summary(title, transcript_text, client)
         message = build_telegram_message(title, link, summary)
