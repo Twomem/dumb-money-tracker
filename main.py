@@ -93,8 +93,9 @@ def _extract_transcript_text(item: object) -> str:
 
 def fetch_transcript_text_supadata(video_id: str, api_key: str) -> str:
     base_url = os.environ.get("SUPADATA_BASE_URL", SUPADATA_DEFAULT_URL)
-    param_name = os.environ.get("SUPADATA_VIDEO_PARAM", "videoId")
+    param_name = os.environ.get("SUPADATA_VIDEO_PARAM", "video_id")
     headers = {
+        "Authorization": f"Bearer {api_key}",
         "x-api-key": api_key,
     }
     response = requests.get(
