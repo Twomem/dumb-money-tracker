@@ -74,9 +74,17 @@ def _normalize_transcript_payload(payload: object) -> str:
     if isinstance(payload, list):
         return " ".join(_extract_transcript_text(item) for item in payload).strip()
     if isinstance(payload, dict):
+        if "text" in payload:
+            return str(payload["text"])
         for key in ("transcript", "data", "result", "items", "entries"):
             if key in payload:
                 return _normalize_transcript_payload(payload[key])
+        for key in ("transcript_text", "transcriptText", "content"):
+            if key in payload:
+                value = payload[key]
+                if key == "content" and isinstance(value, list):
+                    return " ".join(_extract_transcript_text(item) for item in value).strip()
+                return str(value)
     raise ValueError("Supadata response did not include transcript text.")
 
 
@@ -93,9 +101,9 @@ def _extract_transcript_text(item: object) -> str:
 
 def fetch_transcript_text_supadata(video_id: str, api_key: str) -> str:
     base_url = os.environ.get("SUPADATA_BASE_URL", SUPADATA_DEFAULT_URL)
-    param_name = os.environ.get("SUPADATA_VIDEO_PARAM", "video_id")
+    # Supadata expects `videoId` (camelCase) or `url` as the query parameter.
+    param_name = os.environ.get("SUPADATA_VIDEO_PARAM", "videoId")
     headers = {
-        "Authorization": f"Bearer {api_key}",
         "x-api-key": api_key,
     }
     response = requests.get(
