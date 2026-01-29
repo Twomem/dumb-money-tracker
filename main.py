@@ -1,74 +1,195 @@
+import argparse
 import os
-import requests
+from typing import Iterable
+
 import feedparser
+import requests
+from google import genai
 from youtube_transcript_api import YouTubeTranscriptApi
-from google import genai  # <--- New Google library
-from google.genai import types
 
 # Configuration
-GEMINI_KEY = os.environ.get('GEMINI_API_KEY')
-TELEGRAM_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
-TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
+MODEL_NAME = "gemini-2.5-flash"
 CHANNEL_ID = "UCS01CiRDAiyhR_mTHXDW23A"
+FEED_URL = f"https://www.youtube.com/feeds/videos.xml?channel_id={CHANNEL_ID}"
+LAST_VIDEO_PATH = "last_video.txt"
+TELEGRAM_MESSAGE_LIMIT = 4000
 
-def get_latest_video():
-    feed_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={CHANNEL_ID}"
-    feed = feedparser.parse(feed_url)
-    if feed.entries:
-        return feed.entries[0].title, feed.entries[0].link, feed.entries[0].id.split(':')[-1]
-    return None, None, None
 
-def get_summary(transcript_text, title):
-    # Updated to the 2026 'google-genai' Client pattern
-    client = genai.Client(api_key=GEMINI_KEY)
-    
-    prompt = f"Video: {title}\nTranscript: {transcript_text}\n\nSummarize Chris Camillo's specific trade ideas and bold all tickers."
-    
-    response = client.models.generate_content(
-        model="gemini-2.5-flash", # Latest stable model
-        contents=prompt
+def get_env_var(name: str) -> str:
+    value = os.environ.get(name)
+    if not value:
+        raise ValueError(f"Missing required environment variable: {name}")
+    return value
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Summarize the latest Dumb Money Live video and send to Telegram."
     )
-    return response.text
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Send a summary even if the latest video was already processed.",
+    )
+    return parser.parse_args()
 
-def send_telegram(text):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    for i in range(0, len(text), 4000):
-        part = text[i:i+4000]
-        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": part, "parse_mode": "Markdown"})
 
-def main():
-    title, link, video_id = get_latest_video()
-    
-    if os.path.exists("last_video.txt"):
-        with open("last_video.txt", "r") as f:
-            if f.read().strip() == video_id:
-                print("No new video found.")
-                return
+def get_latest_video(feed_url: str) -> tuple[str | None, str | None, str | None]:
+    feed = feedparser.parse(feed_url)
+    if not feed.entries:
+        return None, None, None
+    entry = feed.entries[0]
+    video_id = entry.id.split(":")[-1]
+    return entry.title, entry.link, video_id
+
+
+def read_last_video_id(path: str) -> str | None:
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as handle:
+        value = handle.read().strip()
+    return value or None
+
+
+def write_last_video_id(path: str, video_id: str) -> None:
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(video_id)
+
+
+def fetch_transcript_text(video_id: str) -> str:
+    transcript_api = YouTubeTranscriptApi()
+    transcript_list = transcript_api.list(video_id)
+    try:
+        transcript = transcript_list.find_transcript(["en"])
+    except Exception:
+        transcript = transcript_list.find_generated_transcript(["en"])
+    entries = transcript.fetch()
+    return " ".join(entry["text"] for entry in entries)
+
+
+def chunk_text(text: str, max_chars: int = 12000, overlap: int = 600) -> list[str]:
+    words = text.split()
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for word in words:
+        if current_len + len(word) + 1 > max_chars and current:
+            chunk = " ".join(current)
+            chunks.append(chunk)
+            overlap_words = chunk.split()[-overlap:] if overlap else []
+            current = list(overlap_words)
+            current_len = sum(len(w) + 1 for w in current)
+        current.append(word)
+        current_len += len(word) + 1
+    if current:
+        chunks.append(" ".join(current))
+    return chunks
+
+
+def build_chunk_prompt(title: str, chunk: str, index: int, total: int) -> str:
+    return (
+        "You are summarizing a long YouTube transcript. Focus ONLY on what "
+        "Chris Camillo says or directly implies.\n\n"
+        f"Video title: {title}\n"
+        f"Chunk {index} of {total}\n\n"
+        "Instructions:\n"
+        "- Summarize Chris's statements, ideas, and any trade theses.\n"
+        "- Ignore other speakers unless they directly respond to Chris.\n"
+        "- Keep the summary detailed but concise.\n\n"
+        f"Transcript chunk:\n{chunk}"
+    )
+
+
+def build_final_prompt(title: str, chunk_summaries: Iterable[str]) -> str:
+    combined = "\n\n".join(chunk_summaries)
+    return (
+        "You are producing the final detailed summary of a YouTube video.\n"
+        "Focus ONLY on what Chris Camillo says or implies.\n\n"
+        f"Video title: {title}\n\n"
+        "Instructions:\n"
+        "- Provide a detailed summary of Chris's views and reasoning.\n"
+        "- Highlight any trade ideas, catalysts, or actionable insights.\n"
+        "- Use bullet points for clarity.\n\n"
+        f"Chunk summaries:\n{combined}"
+    )
+
+
+def summarize_with_gemini(client: genai.Client, prompt: str) -> str:
+    response = client.models.generate_content(model=MODEL_NAME, contents=prompt)
+    return response.text or ""
+
+
+def generate_summary(title: str, transcript_text: str, client: genai.Client) -> str:
+    chunks = chunk_text(transcript_text)
+    chunk_summaries = []
+    for index, chunk in enumerate(chunks, start=1):
+        prompt = build_chunk_prompt(title, chunk, index, len(chunks))
+        chunk_summaries.append(summarize_with_gemini(client, prompt))
+    final_prompt = build_final_prompt(title, chunk_summaries)
+    return summarize_with_gemini(client, final_prompt)
+
+
+def send_telegram_message(token: str, chat_id: str, text: str) -> None:
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    for start in range(0, len(text), TELEGRAM_MESSAGE_LIMIT):
+        part = text[start : start + TELEGRAM_MESSAGE_LIMIT]
+        requests.post(url, data={"chat_id": chat_id, "text": part}, timeout=30)
+
+
+def build_telegram_message(title: str, link: str, summary: str) -> str:
+    return (
+        "🚀 New Dumb Money Live summary\n\n"
+        f"Video: {title}\n"
+        f"Link: {link}\n\n"
+        "Chris Camillo summary:\n"
+        f"{summary}"
+    )
+
+
+def should_process_video(*, force_run: bool, last_video_id: str | None, video_id: str) -> bool:
+    if force_run:
+        return True
+    return last_video_id != video_id
+
+
+def main() -> None:
+    args = parse_args()
+    try:
+        gemini_key = get_env_var("GEMINI_API_KEY")
+        telegram_token = get_env_var("TELEGRAM_BOT_TOKEN")
+        telegram_chat_id = get_env_var("TELEGRAM_CHAT_ID")
+    except ValueError as exc:
+        print(exc)
+        return
+
+    title, link, video_id = get_latest_video(FEED_URL)
+    if not video_id or not title or not link:
+        print("No video entries found in feed.")
+        return
+
+    last_video_id = read_last_video_id(LAST_VIDEO_PATH)
+    force_run = args.force or os.environ.get("FORCE_RUN", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    if not should_process_video(
+        force_run=force_run, last_video_id=last_video_id, video_id=video_id
+    ):
+        print("No new video found.")
+        return
 
     try:
-        # 1. Create a tool instance (The "New" Way)
-        ytt_api = YouTubeTranscriptApi() 
-        
-        # 2. Get the list of available transcripts
-        transcript_list = ytt_api.list(video_id)
-        
-        # 3. Find the English one and fetch it
-        transcript = transcript_list.find_transcript(['en']).fetch()
-        full_text = " ".join([t['text'] for t in transcript])
-        
-        # 4. Pass to Gemini for analysis
-        summary = get_summary(full_text, title)
-        
-        # 5. Notify via Telegram
-        msg = f"🚀 *New Alpha*\n\n*Video:* {title}\n\n{summary}\n\n[Watch]({link})"
-        send_telegram(msg)
-        
-        # 6. Save video ID so we don't repeat
-        with open("last_video.txt", "w") as f:
-            f.write(video_id)
-            
-    except Exception as e:
-        print(f"Error logic: {e}")
+        transcript_text = fetch_transcript_text(video_id)
+        client = genai.Client(api_key=gemini_key)
+        summary = generate_summary(title, transcript_text, client)
+        message = build_telegram_message(title, link, summary)
+        send_telegram_message(telegram_token, telegram_chat_id, message)
+        write_last_video_id(LAST_VIDEO_PATH, video_id)
+        print("Summary sent and last video ID updated.")
+    except Exception as exc:
+        print(f"Error processing video: {exc}")
+
 
 if __name__ == "__main__":
     main()
