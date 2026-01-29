@@ -13,6 +13,7 @@ CHANNEL_ID = "UCS01CiRDAiyhR_mTHXDW23A"
 FEED_URL = f"https://www.youtube.com/feeds/videos.xml?channel_id={CHANNEL_ID}"
 LAST_VIDEO_PATH = "last_video.txt"
 TELEGRAM_MESSAGE_LIMIT = 4000
+SUPADATA_DEFAULT_URL = "https://api.supadata.ai/v1/youtube/transcript"
 
 
 def get_env_var(name: str) -> str:
@@ -65,6 +66,47 @@ def fetch_transcript_text(video_id: str) -> str:
         transcript = transcript_list.find_generated_transcript(["en"])
     entries = transcript.fetch()
     return " ".join(entry["text"] for entry in entries)
+
+
+def _normalize_transcript_payload(payload: object) -> str:
+    if isinstance(payload, str):
+        return payload
+    if isinstance(payload, list):
+        return " ".join(_extract_transcript_text(item) for item in payload).strip()
+    if isinstance(payload, dict):
+        for key in ("transcript", "data", "result", "items", "entries"):
+            if key in payload:
+                return _normalize_transcript_payload(payload[key])
+    raise ValueError("Supadata response did not include transcript text.")
+
+
+def _extract_transcript_text(item: object) -> str:
+    if isinstance(item, str):
+        return item
+    if isinstance(item, dict):
+        if "text" in item:
+            return str(item["text"])
+        if "transcript" in item:
+            return _normalize_transcript_payload(item["transcript"])
+    return str(item)
+
+
+def fetch_transcript_text_supadata(video_id: str, api_key: str) -> str:
+    base_url = os.environ.get("SUPADATA_BASE_URL", SUPADATA_DEFAULT_URL)
+    param_name = os.environ.get("SUPADATA_VIDEO_PARAM", "video_id")
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "x-api-key": api_key,
+    }
+    response = requests.get(
+        base_url,
+        headers=headers,
+        params={param_name: video_id},
+        timeout=30,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    return _normalize_transcript_payload(payload)
 
 
 def chunk_text(text: str, max_chars: int = 12000, overlap: int = 600) -> list[str]:
@@ -161,6 +203,7 @@ def main() -> None:
     except ValueError as exc:
         print(exc)
         return
+    supadata_api_key = os.environ.get("SUPADATA_API_KEY")
 
     title, link, video_id = get_latest_video(FEED_URL)
     if not video_id or not title or not link:
@@ -180,7 +223,10 @@ def main() -> None:
         return
 
     try:
-        transcript_text = fetch_transcript_text(video_id)
+        if supadata_api_key:
+            transcript_text = fetch_transcript_text_supadata(video_id, supadata_api_key)
+        else:
+            transcript_text = fetch_transcript_text(video_id)
         client = genai.Client(api_key=gemini_key)
         summary = generate_summary(title, transcript_text, client)
         message = build_telegram_message(title, link, summary)

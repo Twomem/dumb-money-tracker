@@ -2,8 +2,8 @@ name: Dumb Money Alpha Tracker
 
 on:
   schedule:
-    # Runs at minute 15 of every 3rd hour (Staggered to avoid peak GitHub traffic)
-    - cron: '15 */3 * * *'
+    # Runs at minute 15 of every 8th hour (Staggered to avoid peak GitHub traffic)
+    - cron: '15 */8 * * *'
   workflow_dispatch:
     inputs:
       force:
@@ -36,6 +36,7 @@ jobs:
       - name: Run Alpha Tracker
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          SUPADATA_API_KEY: ${{ secrets.SUPADATA_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           FORCE_RUN: ${{ github.event.inputs.force }}
