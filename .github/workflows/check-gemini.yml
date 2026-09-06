@@ -32,7 +32,8 @@ jobs:
           if not key:
               raise SystemExit("GEMINI_API_KEY is missing or empty.")
           try:
-              result = genai.Client(api_key=key).models.generate_content(
+              client = genai.Client(api_key=key)
+              result = client.models.generate_content(
                   model=MODEL_NAME,
                   contents="Reply with the single word OK.",
                   config={
