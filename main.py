@@ -4,7 +4,7 @@ from datetime import datetime
 import requests
 from google import genai
 
-MODEL_NAME = "gemini-2.5-flash"
+MODEL_NAME = "gemini-3.8-flash"
 CHANNEL_ID = "UCS01CiRDAiyhR_mTHXDW23A"
 LAST_VIDEO_PATH = "last_video.txt"
 
