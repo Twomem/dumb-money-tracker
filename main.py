@@ -1,4 +1,6 @@
 import os
+from datetime import datetime
+
 import requests
 from google import genai
 
@@ -8,6 +10,7 @@ LAST_VIDEO_PATH = "last_video.txt"
 
 SUPADATA_CHANNEL_VIDEOS_URL = "https://api.supadata.ai/v1/youtube/channel/videos"
 SUPADATA_TRANSCRIPT_URL = "https://api.supadata.ai/v1/youtube/transcript"
+SUPADATA_METADATA_URL = "https://api.supadata.ai/v1/metadata"
 
 TELEGRAM_MESSAGE_LIMIT = 4000
 
@@ -32,20 +35,43 @@ def write_last_video_id(video_id: str) -> None:
 
 
 def get_latest_longform_video_id(supadata_key: str, channel_id: str) -> str:
-    # Supadata supports type=video to return ONLY long-form (vertical) videos
-    # Response includes { videoIds: [...], shortIds: [...], liveIds: [...] }
-    r = requests.get(
-        SUPADATA_CHANNEL_VIDEOS_URL,
-        headers={"x-api-key": supadata_key},
-        params={"id": channel_id, "type": "video", "limit": 5},
-        timeout=30,
-    )
-    r.raise_for_status()
-    data = r.json()
-    video_ids = data.get("videoIds") or []
-    if not video_ids:
-        raise RuntimeError("No long-form videos returned by Supadata.")
-    return str(video_ids[0])  # latest-first
+    # Query each tab separately: type=all fills its limit with uploads first,
+    # which can leave out livestream replays entirely. Never include Shorts.
+    candidates = []
+    for video_type, field in (("video", "videoIds"), ("live", "liveIds")):
+        r = requests.get(
+            SUPADATA_CHANNEL_VIDEOS_URL,
+            headers={"x-api-key": supadata_key},
+            params={"id": channel_id, "type": video_type, "limit": 5},
+            timeout=30,
+        )
+        r.raise_for_status()
+        video_ids = r.json().get(field) or []
+        print(f"Latest {video_type} IDs: {video_ids}")
+        if video_ids:
+            candidates.append(str(video_ids[0]))
+
+    if not candidates:
+        raise RuntimeError("No uploads or livestreams returned by Supadata.")
+
+    # Each tab is latest-first, but the two tabs need a common date ordering.
+    # Comparing dates prevents alternating between an old upload and a replay.
+    dated_candidates = []
+    for video_id in dict.fromkeys(candidates):
+        r = requests.get(
+            SUPADATA_METADATA_URL,
+            headers={"x-api-key": supadata_key},
+            params={"url": f"https://www.youtube.com/watch?v={video_id}"},
+            timeout=30,
+        )
+        r.raise_for_status()
+        published = datetime.fromisoformat(r.json()["createdAt"].replace("Z", "+00:00"))
+        if published.tzinfo is None:
+            raise RuntimeError(f"Missing publication timezone for {video_id}.")
+        dated_candidates.append((published, video_id))
+    latest_video_id = max(dated_candidates)[1]
+    print(f"Latest upload or livestream: {latest_video_id}")
+    return latest_video_id
 
 
 def get_transcript_text(supadata_key: str, video_id: str) -> str:
@@ -138,14 +164,13 @@ def main() -> None:
     title = f"Dumb Money Live ({latest_video_id})"
 
     transcript = get_transcript_text(supadata_key, latest_video_id)
+    if not transcript:
+        raise RuntimeError("Transcript is empty; leaving video pending for the next run.")
     summary = summarize_transcript(title, transcript, gemini_key)
+    if not summary:
+        raise RuntimeError("Summary is empty; leaving video pending for the next run.")
 
-    message = (
-        "🚀 New Dumb Money Live summary\n\n"
-        f"Link: {link}\n\n"
-        "Chris Camillo summary:\n"
-        f"{summary}"
-    )
+    message = f"🚀 New Dumb Money Live summary\n\nLink: {link}\n\nChris Camillo summary:\n{summary}"
 
     telegram_send(telegram_token, telegram_chat_id, message)
     write_last_video_id(latest_video_id)

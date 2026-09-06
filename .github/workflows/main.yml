@@ -1,6 +1,12 @@
 name: Dumb Money Alpha Tracker
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - main.py
+      - requirements.txt
+      - .github/workflows/main.yml
   schedule:
     # Runs at minute 15 of every 8th hour (Staggered to avoid peak GitHub traffic)
     - cron: '15 */8 * * *'
@@ -10,6 +16,10 @@ on:
         description: "Force sending a summary even if the latest video was already processed."
         required: false
         default: "false"
+
+concurrency:
+  group: dumb-money-tracker
+  cancel-in-progress: false
 
 jobs:
   build:
