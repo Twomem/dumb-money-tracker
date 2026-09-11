@@ -1,16 +1,23 @@
+import json
+import math
 import os
-from datetime import datetime
+import re
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from pathlib import Path
 
 import requests
 from google import genai
+from yt_dlp import YoutubeDL
 
 MODEL_NAME = "gemini-3.8-flash"
 CHANNEL_ID = "UCS01CiRDAiyhR_mTHXDW23A"
 LAST_VIDEO_PATH = "last_video.txt"
 
-SUPADATA_CHANNEL_VIDEOS_URL = "https://api.supadata.ai/v1/youtube/channel/videos"
-SUPADATA_TRANSCRIPT_URL = "https://api.supadata.ai/v1/youtube/transcript"
-SUPADATA_METADATA_URL = "https://api.supadata.ai/v1/metadata"
+SUPADATA_TRANSCRIPT_URL = "https://api.supadata.ai/v1/transcript"
+SUPADATA_ACCOUNT_URL = "https://api.supadata.ai/v1/me"
+CACHE_DIR = Path(".tracker-cache")
+CREDIT_LIMIT = 95
 
 TELEGRAM_MESSAGE_LIMIT = 4000
 
@@ -34,65 +41,121 @@ def write_last_video_id(video_id: str) -> None:
         f.write(video_id)
 
 
-def get_latest_longform_video_id(supadata_key: str, channel_id: str) -> str:
-    # Query each tab separately: type=all fills its limit with uploads first,
-    # which can leave out livestream replays entirely. Never include Shorts.
+def cache_path(kind: str, video_id: str) -> Path:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+        raise ValueError("Invalid YouTube video ID")
+    return CACHE_DIR / kind / f"{video_id}.json"
+
+
+def save_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(data), encoding="utf-8")
+    temporary.replace(path)
+
+
+def video_is_ready(video_id: str) -> bool:
+    path = cache_path("metadata", video_id)
+    if path.exists():
+        return json.loads(path.read_text(encoding="utf-8"))["ready"]
+    # Metadata only: no video/audio downloads and no paid API calls.
+    with YoutubeDL(
+        {
+            "quiet": True,
+            "skip_download": True,
+            "ignore_no_formats_error": True,
+            "socket_timeout": 30,
+        }
+    ) as youtube:
+        info = youtube.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+    if not info:
+        raise RuntimeError("YouTube did not return video metadata")
+    if info.get("live_status") in {"is_live", "is_upcoming", "post_live"}:
+        return False  # Recheck next run; never cache an unfinished stream.
+    duration = info.get("duration")
+    if not isinstance(duration, (int, float)) or duration <= 0:
+        raise RuntimeError("YouTube did not return a valid duration")
+    # Conservatively exclude all clips <=3 minutes, including Shorts.
+    ready = duration > 180
+    save_json(path, {"ready": ready})
+    return ready
+
+
+def get_latest_longform_video_id(channel_id: str) -> str:
+    response = requests.get(
+        "https://www.youtube.com/feeds/videos.xml", params={"channel_id": channel_id}, timeout=30
+    )
+    response.raise_for_status()
+    root = ET.fromstring(response.content)
+    ns = {"atom": "http://www.w3.org/2005/Atom", "yt": "http://www.youtube.com/xml/schemas/2015"}
     candidates = []
-    for video_type, field in (("video", "videoIds"), ("live", "liveIds")):
-        r = requests.get(
-            SUPADATA_CHANNEL_VIDEOS_URL,
-            headers={"x-api-key": supadata_key},
-            params={"id": channel_id, "type": video_type, "limit": 5},
-            timeout=30,
-        )
-        r.raise_for_status()
-        video_ids = r.json().get(field) or []
-        print(f"Latest {video_type} IDs: {video_ids}")
-        if video_ids:
-            candidates.append(str(video_ids[0]))
+    for entry in root.findall("atom:entry", ns):
+        video_id = entry.findtext("yt:videoId", namespaces=ns)
+        published = entry.findtext("atom:published", namespaces=ns)
+        if not video_id or not published:
+            raise RuntimeError("Incomplete YouTube feed entry")
+        date = datetime.fromisoformat(published.replace("Z", "+00:00"))
+        if date.tzinfo is None:
+            raise RuntimeError("Missing publication timezone")
+        if date <= datetime.now(timezone.utc):
+            candidates.append((date, video_id))
+    for _, video_id in sorted(candidates, reverse=True):
+        if video_is_ready(video_id):
+            print(f"Latest completed long-form video: {video_id}")
+            return video_id
+    raise RuntimeError("No completed long-form videos in YouTube's recent feed")
 
-    if not candidates:
-        raise RuntimeError("No uploads or livestreams returned by Supadata.")
 
-    # Each tab is latest-first, but the two tabs need a common date ordering.
-    # Comparing dates prevents alternating between an old upload and a replay.
-    dated_candidates = []
-    for video_id in dict.fromkeys(candidates):
-        r = requests.get(
-            SUPADATA_METADATA_URL,
-            headers={"x-api-key": supadata_key},
-            params={"url": f"https://www.youtube.com/watch?v={video_id}"},
-            timeout=30,
+def check_credit_budget(supadata_key: str) -> None:
+    response = requests.get(SUPADATA_ACCOUNT_URL, headers={"x-api-key": supadata_key}, timeout=30)
+    response.raise_for_status()
+    data = response.json()
+    used, maximum = data.get("usedCredits"), data.get("maxCredits")
+    if any(
+        type(value) not in (int, float) or not math.isfinite(value) or value < 0
+        for value in (used, maximum)
+    ):
+        raise RuntimeError("Cannot verify Supadata credit usage; refusing transcript request")
+    ceiling = min(CREDIT_LIMIT, maximum - 5)
+    if used + 1 > ceiling:
+        raise RuntimeError(
+            f"Supadata credit guard: {used:g} used; limit {ceiling:g}. "
+            "Waiting for the billing allowance to renew; no transcript requested."
         )
-        r.raise_for_status()
-        published = datetime.fromisoformat(r.json()["createdAt"].replace("Z", "+00:00"))
-        if published.tzinfo is None:
-            raise RuntimeError(f"Missing publication timezone for {video_id}.")
-        dated_candidates.append((published, video_id))
-    latest_video_id = max(dated_candidates)[1]
-    print(f"Latest upload or livestream: {latest_video_id}")
-    return latest_video_id
+    print(f"Supadata usage: {used:g}/{maximum:g}; tracker ceiling: {ceiling:g}")
 
 
 def get_transcript_text(supadata_key: str, video_id: str) -> str:
-    # Supadata youtube transcript supports videoId and text=true (plain text transcript).
-    r = requests.get(
+    path = cache_path("transcripts", video_id)
+    if path.exists():
+        content = json.loads(path.read_text(encoding="utf-8")).get("content")
+        if isinstance(content, str) and content.strip():
+            print(f"Using cached transcript: {video_id}")
+            return content
+        raise RuntimeError("Invalid cached transcript; refusing automatic refetch")
+    check_credit_budget(supadata_key)
+    response = requests.get(
         SUPADATA_TRANSCRIPT_URL,
         headers={"x-api-key": supadata_key},
-        params={"videoId": video_id, "text": "true"},
+        params={
+            "url": f"https://www.youtube.com/watch?v={video_id}",
+            "text": "true",
+            "mode": "native",
+        },
         timeout=60,
     )
-    r.raise_for_status()
-    data = r.json()
-
-    # Docs say text=true returns plain text, but be robust to either string or chunk list.
-    content = data.get("content")
-    if isinstance(content, str):
-        return content.strip()
+    response.raise_for_status()
+    if response.status_code != 200:
+        raise RuntimeError("Native transcript not ready; leaving video pending")
+    content = response.json().get("content")
     if isinstance(content, list):
-        return " ".join(str(x.get("text", "")) for x in content if isinstance(x, dict)).strip()
-
-    raise RuntimeError("Unexpected Supadata transcript response format.")
+        content = " ".join(str(x.get("text", "")) for x in content if isinstance(x, dict))
+    if not isinstance(content, str) or not content.strip():
+        raise RuntimeError("Transcript is empty or invalid; leaving video pending")
+    content = content.strip()
+    # Saved before Gemini/Telegram: later failures must not require another purchase.
+    save_json(path, {"content": content})
+    return content
 
 
 def chunk_text(text: str, max_chars: int = 12000) -> list[str]:
@@ -152,7 +215,7 @@ def main() -> None:
 
     force = os.environ.get("FORCE_RUN", "").lower() in {"1", "true", "yes"}
 
-    latest_video_id = get_latest_longform_video_id(supadata_key, CHANNEL_ID)
+    latest_video_id = get_latest_longform_video_id(CHANNEL_ID)
     last_video_id = read_last_video_id()
 
     if (not force) and last_video_id == latest_video_id:

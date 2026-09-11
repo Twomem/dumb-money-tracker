@@ -24,6 +24,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     
     # Crucial for allowing the bot to save 'last_video.txt' back to your repo
     permissions:
@@ -43,6 +44,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Restore transcripts and video metadata
+        id: restore-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .tracker-cache
+          key: tracker-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: tracker-v1-
+
       - name: Run Alpha Tracker
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -51,6 +60,13 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           FORCE_RUN: ${{ github.event.inputs.force }}
         run: python main.py
+
+      - name: Save transcripts even when summarisation fails
+        if: ${{ always() && steps.restore-cache.outcome == 'success' }}
+        uses: actions/cache/save@v4
+        with:
+          path: .tracker-cache
+          key: tracker-v1-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Commit and Push last_video.txt
         run: |
