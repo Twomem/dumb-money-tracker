@@ -54,31 +54,28 @@ def save_json(path: Path, data: dict) -> None:
     temporary.replace(path)
 
 
-def video_is_ready(video_id: str) -> bool:
-    path = cache_path("metadata", video_id)
-    if path.exists():
-        return json.loads(path.read_text(encoding="utf-8"))["ready"]
-    # Metadata only: no video/audio downloads and no paid API calls.
+def get_channel_video_status(channel_id: str) -> dict[str, bool]:
+    # Flat public listings avoid playback requests, which YouTube blocks on CI IPs.
+    # Query both tabs explicitly; Shorts are on a separate tab and never requested.
+    status = {}
     with YoutubeDL(
-        {
-            "quiet": True,
-            "skip_download": True,
-            "ignore_no_formats_error": True,
-            "socket_timeout": 30,
-        }
+        {"quiet": True, "extract_flat": True, "playlistend": 20, "socket_timeout": 30}
     ) as youtube:
-        info = youtube.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
-    if not info:
-        raise RuntimeError("YouTube did not return video metadata")
-    if info.get("live_status") in {"is_live", "is_upcoming", "post_live"}:
-        return False  # Recheck next run; never cache an unfinished stream.
-    duration = info.get("duration")
-    if not isinstance(duration, (int, float)) or duration <= 0:
-        raise RuntimeError("YouTube did not return a valid duration")
-    # Conservatively exclude all clips <=3 minutes, including Shorts.
-    ready = duration > 180
-    save_json(path, {"ready": ready})
-    return ready
+        for tab in ("videos", "streams"):
+            info = youtube.extract_info(
+                f"https://www.youtube.com/channel/{channel_id}/{tab}", download=False
+            )
+            if not info or "entries" not in info:
+                raise RuntimeError(f"YouTube did not return the {tab} listing")
+            for entry in info["entries"]:
+                duration = entry.get("duration")
+                ready = (
+                    entry.get("live_status") not in {"is_live", "is_upcoming", "post_live"}
+                    and isinstance(duration, (int, float))
+                    and duration > 180
+                )
+                status[entry["id"]] = ready
+    return status
 
 
 def get_latest_longform_video_id(channel_id: str) -> str:
@@ -99,8 +96,9 @@ def get_latest_longform_video_id(channel_id: str) -> str:
             raise RuntimeError("Missing publication timezone")
         if date <= datetime.now(timezone.utc):
             candidates.append((date, video_id))
+    status = get_channel_video_status(channel_id)
     for _, video_id in sorted(candidates, reverse=True):
-        if video_is_ready(video_id):
+        if status.get(video_id, False):
             print(f"Latest completed long-form video: {video_id}")
             return video_id
     raise RuntimeError("No completed long-form videos in YouTube's recent feed")

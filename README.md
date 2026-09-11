@@ -47,7 +47,7 @@ fail the run without advancing `last_video.txt`, allowing a later retry.
 ## Staying within Supadata's free plan
 
 Video discovery uses YouTube's public Atom feed (uploads and livestreams), with
-metadata-only `yt-dlp` checks. It costs no Supadata credits and needs no new key.
+flat public-channel `yt-dlp` listings (no playback requests). It costs no Supadata credits and needs no new key.
 Completed videos longer than three minutes are eligible; this conservatively
 excludes Shorts and other short clips. Live/upcoming/processing streams are
 rechecked later. Only the latest eligible video in the feed is processed, as
@@ -64,7 +64,7 @@ off, especially if other apps also use the account.
 Transcripts use `mode=native` (one credit; no AI-generation fallback). Successful
 transcripts are saved before Gemini runs. GitHub Actions restores `.tracker-cache`
 and saves it even after a failed summary, so retries normally reuse the transcript.
-The cache contains public-video text and metadata only, never API keys. GitHub
+The cache contains public-video text only, never API keys. GitHub
 can evict caches; after eviction a transcript may need fetching again, subject to
 the same credit guard. Missing transcripts may consume a credit on each attempt.
 Force runs reuse cached transcripts and cannot bypass the budget.

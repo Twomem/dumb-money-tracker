@@ -37,10 +37,12 @@ def test_feed_sorts_uploads_and_replays_and_skips_shorts(monkeypatch):
         )
     )
     monkeypatch.setattr(tracker.requests, "get", get)
-    ready = Mock(side_effect=lambda v: v != "short")
-    monkeypatch.setattr(tracker, "video_is_ready", ready)
+    monkeypatch.setattr(
+        tracker,
+        "get_channel_video_status",
+        Mock(return_value={"old": True, "replay": True, "short": False}),
+    )
     assert tracker.get_latest_longform_video_id("channel") == "replay"
-    assert [c.args[0] for c in ready.call_args_list] == ["short", "replay"]
     assert all("supadata" not in c.args[0] for c in get.call_args_list)
 
 
@@ -155,29 +157,37 @@ def test_guard_fails_closed_when_account_api_down(monkeypatch, cache):
     get.assert_called_once()
 
 
-@pytest.mark.parametrize(
-    "info,expected,cached",
-    [
-        ({"live_status": "is_live"}, False, False),
-        ({"live_status": "is_upcoming"}, False, False),
-        ({"live_status": "post_live"}, False, False),
-        ({"live_status": "was_live", "duration": 3600}, True, True),
-        ({"live_status": "not_live", "duration": 180}, False, True),
-        ({"live_status": "not_live", "duration": 600}, True, True),
-    ],
-)
-def test_video_filter_and_metadata_cache(monkeypatch, cache, info, expected, cached):
+def test_flat_listings_skip_shorts_and_unfinished_streams(monkeypatch):
     youtube = Mock()
-    youtube.extract_info.return_value = info
+    youtube.extract_info.side_effect = [
+        {"entries": [{"id": "upload", "duration": 400}, {"id": "clip", "duration": 180}]},
+        {
+            "entries": [
+                {"id": "replay", "duration": 4000, "live_status": "was_live"},
+                {"id": "live", "duration": 4000, "live_status": "is_live"},
+                {"id": "upcoming", "live_status": "is_upcoming"},
+                {"id": "processing", "duration": 4000, "live_status": "post_live"},
+            ]
+        },
+    ]
     factory = Mock()
     factory.return_value.__enter__ = Mock(return_value=youtube)
     factory.return_value.__exit__ = Mock(return_value=False)
     monkeypatch.setattr(tracker, "YoutubeDL", factory)
-    assert tracker.video_is_ready("abcdefghijk") is expected
-    assert tracker.cache_path("metadata", "abcdefghijk").exists() is cached
-    if cached:
-        assert tracker.video_is_ready("abcdefghijk") is expected
-        youtube.extract_info.assert_called_once()
+    assert tracker.get_channel_video_status("channel") == {
+        "upload": True,
+        "clip": False,
+        "replay": True,
+        "live": False,
+        "upcoming": False,
+        "processing": False,
+    }
+    assert factory.call_args.args[0]["extract_flat"] is True
+    assert [c.args[0].rsplit("/", 1)[-1] for c in youtube.extract_info.call_args_list] == [
+        "videos",
+        "streams",
+    ]
+    assert all(c.kwargs["download"] is False for c in youtube.extract_info.call_args_list)
 
 
 def test_empty_transcript_not_cached(monkeypatch, cache):
