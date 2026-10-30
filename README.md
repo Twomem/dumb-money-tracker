@@ -6,9 +6,11 @@ to Telegram via a GitHub Actions cron job.
 ## How it works
 
 1. A GitHub Actions workflow runs every 8 hours.
-2. The workflow checks YouTube's free feed and video metadata to select the newest
-   completed long-form episode, excluding clips of three minutes or less.
-3. If a new video is found, the transcript is fetched with Supadata and summarized with Gemini.
+2. The workflow checks YouTube's public uploads playlist (flat listing, no playback
+   and no YouTube Data API) and selects the newest completed long-form episode,
+   excluding Shorts, unfinished live streams, and clips of three minutes or less.
+3. If a new video is found, the transcript is fetched with Supadata and summarized with
+   a free Gemini model. If that model is overloaded, a second free model is tried once.
 4. The summary is sent to Telegram and the last processed video ID is saved.
 
 ## Required secrets
@@ -46,12 +48,15 @@ fail the run without advancing `last_video.txt`, allowing a later retry.
 
 ## Staying within Supadata's free plan
 
-Video discovery uses YouTube's public Atom feed (uploads and livestreams), with
-flat public-channel `yt-dlp` listings (no playback requests). It costs no Supadata credits and needs no new key.
-Completed videos longer than three minutes are eligible; this conservatively
-excludes Shorts and other short clips. Live/upcoming/processing streams are
-rechecked later. Only the latest eligible video in the feed is processed, as
-before; the feed is a recent window, not a historical backfill mechanism.
+Video discovery uses YouTube's public uploads playlist via a flat `yt-dlp` listing
+(no playback requests and no YouTube Data API key). It costs no Supadata credits.
+The channel Atom feed is not used: it only keeps about 15 mixed uploads, so a
+shorts-only stretch hid every long episode and failed the job, and that endpoint
+also returns HTTP 404 for hours at a time. Completed videos longer than three
+minutes are eligible; this excludes Shorts and other short clips. Live, upcoming,
+and still-processing streams are skipped and rechecked later. Only the latest
+eligible video in the recent uploads window is processed; it is not a historical
+backfill.
 
 Before every uncached transcript request, `/v1/me` checks actual account-wide
 billing-period usage. The tracker refuses a request that would exceed 95 credits
@@ -69,5 +74,14 @@ can evict caches; after eviction a transcript may need fetching again, subject t
 the same credit guard. Missing transcripts may consume a credit on each attempt.
 Force runs reuse cached transcripts and cannot bypass the budget.
 
-The Gemini model and Telegram destination are unchanged. Gemini availability
-errors can still delay delivery, but no longer require refetching a cached transcript.
+Summaries use the free Gemini API with the existing `GEMINI_API_KEY`. The primary
+model is `gemini-3.5-flash-lite`, which has a large free daily allowance.
+`gemini-3.1-flash-lite` is tried once if the primary model is overloaded, rate
+limited, or returns nothing. Each request has a 45 second timeout and no SDK retry
+loop, so a 503 does not burn the job's Actions minutes. `gemini-3.8-flash` stays
+free but was failing these runs with 503 high-demand errors and a much smaller
+free daily cap, which chunked summaries can exhaust. A failed or empty summary does
+not advance `last_video.txt`, so the same video is retried on the next run. A
+summary that was produced but not delivered is cached and reused, so the retry
+does not spend another Gemini request. Gemini availability errors can still delay
+delivery until the next run, but they no longer require refetching a cached transcript.
