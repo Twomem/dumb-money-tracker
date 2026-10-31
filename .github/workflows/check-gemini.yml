@@ -25,27 +25,20 @@ jobs:
         run: |
           python - <<'PY'
           import os
-          from google import genai
-          from main import MODEL_NAME
+          from main import FALLBACK_MODEL_NAMES, MODEL_NAME, generate_with_fallback, make_gemini_client
 
           key = os.environ.get("GEMINI_API_KEY", "")
           if not key:
               raise SystemExit("GEMINI_API_KEY is missing or empty.")
           try:
-              client = genai.Client(api_key=key)
-              result = client.models.generate_content(
-                  model=MODEL_NAME,
-                  contents="Reply with the single word OK.",
-                  config={
-                      "max_output_tokens": 64,
-                      "thinking_config": {"thinking_level": "low"},
-                  },
-              )
-              if not result.text:
+              client = make_gemini_client(key)
+              text = generate_with_fallback(client, "Reply with the single word OK.", 64)
+              if not text:
                   raise SystemExit("Gemini returned no text; validation incomplete.")
           except Exception as exc:
               print(f"Gemini access check failed: {str(exc).replace(key, '[REDACTED]')}")
               raise SystemExit(1)
-          print(f"SUCCESS: GitHub secret authenticated and generated text with {MODEL_NAME}.")
+          print(f"SUCCESS: GitHub secret authenticated. Primary model {MODEL_NAME}.")
+          print(f"Fallback if that model is overloaded: {', '.join(FALLBACK_MODEL_NAMES)}.")
           print("No Telegram sent. Billing tier is not exposed by this request.")
           PY
